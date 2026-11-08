@@ -14,7 +14,7 @@
 #include <stdarg.h>
 #include <string.h>
 
-#define P2PF_VERSION "1.1.0"
+#define P2PF_VERSION "1.2.0"
 
 // prototype2.exe (Steam 2025-09-29 update) window-mode selector: 0 = fullscreen, 1 = borderless, 2 = windowed.
 // It returns 1 only for "windowed borderless" on the command line; we can force it.
@@ -49,13 +49,23 @@ static void logf(const char *fmt, ...) {
   if (g_log != INVALID_HANDLE_VALUE) { DWORD w; WriteFile(g_log, buf, (DWORD)n, &w, NULL); }
 }
 
+static char g_logpath[MAX_PATH];
+
 static void open_log(void) {
-  char path[MAX_PATH];
-  DWORD len = GetModuleFileNameA(NULL, path, MAX_PATH);
-  while (len > 0 && path[len - 1] != '\\' && path[len - 1] != '/') len--;
-  if (len + sizeof("P2PhysFix.log") >= MAX_PATH) return;
-  memcpy(path + len, "P2PhysFix.log", sizeof("P2PhysFix.log"));
-  g_log = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  DWORD len = GetModuleFileNameA(NULL, g_logpath, MAX_PATH);
+  while (len > 0 && g_logpath[len - 1] != '\\' && g_logpath[len - 1] != '/') len--;
+  if (len + sizeof("P2PhysFix.log") >= MAX_PATH) { g_logpath[0] = 0; return; }
+  memcpy(g_logpath + len, "P2PhysFix.log", sizeof("P2PhysFix.log"));
+  g_log = CreateFileA(g_logpath, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+}
+
+// Later messages (from the cursor thread) are appended to the log written in DllMain.
+static void logf_append(const char *msg) {
+  if (!g_logpath[0]) return;
+  HANDLE h = CreateFileA(g_logpath, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+  if (h == INVALID_HANDLE_VALUE) return;
+  DWORD w; WriteFile(h, msg, (DWORD)strlen(msg), &w, NULL); WriteFile(h, "\r\n", 2, &w, NULL);
+  CloseHandle(h);
 }
 
 typedef struct { DWORD va; BYTE orig[16]; int len; const char *what; } Site;
@@ -245,6 +255,125 @@ static void apply_borderless(void) {
        GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
 }
 
+// --- cursor: deterministic hide/show + confinement ---------------------------
+// The engine hides/shows the Windows cursor with ShowCursor(FALSE/TRUE) when its window gains/loses focus
+// (engine 0x10684800; on focus loss it also minimizes the window). ShowCursor only moves a per-thread counter, and in
+// windowed/borderless mode activation messages arrive in unbalanced bursts (startup, alt+tab, minimize/restore), so
+// the counter drifts and the Windows arrow stays "visible" over the game - which also makes the AMD overlay flicker.
+// Fix: the engine's ShowCursor import is redirected to a function that sets an absolute state (counter -1 = hidden,
+// 0 = visible). The game window is subclassed (no change to WM_SETCURSOR) to re-apply that state on focus changes
+// and to confine the cursor to the window while the game is active, so it cannot wander to another monitor.
+#define ENG_IAT_SHOWCURSOR 0x109E541Cu
+typedef int (WINAPI *ShowCursor_t)(BOOL);
+static ShowCursor_t g_realShowCursor;
+static int g_confine;
+static UINT g_msgApply;
+static WNDPROC g_oldWndProc;
+
+// Must run on the game window's thread (the display counter is per thread). Normalizes to exactly -1 or 0.
+static int set_cursor_visible(BOOL show) {
+  ShowCursor_t sc = g_realShowCursor ? g_realShowCursor : ShowCursor;
+  int c = sc(show), i = 0;
+  if (show) { while (c > 0 && i++ < 4096) c = sc(FALSE); while (c < 0 && i++ < 8192) c = sc(TRUE); }
+  else      { while (c < -1 && i++ < 4096) c = sc(TRUE); while (c >= 0 && i++ < 8192) c = sc(FALSE); }
+  return c;
+}
+static int WINAPI showcursor_hook(BOOL show) { return set_cursor_visible(show); }
+
+static void confine(HWND h, BOOL on) {
+  if (!g_confine) return;
+  if (!on) { ClipCursor(NULL); return; }
+  RECT r, cur;
+  if (!GetClientRect(h, &r)) return;
+  MapWindowPoints(h, NULL, (POINT *)&r, 2);
+  if (GetClipCursor(&cur) && EqualRect(&cur, &r)) return;
+  ClipCursor(&r);
+}
+
+static void apply_focus_state(HWND h) {
+  BOOL active = (GetForegroundWindow() == h) && !IsIconic(h);
+  set_cursor_visible(!active);
+  confine(h, active);
+}
+
+static LRESULT CALLBACK cursor_wndproc(HWND h, UINT m, WPARAM w, LPARAM l) {
+  if (g_msgApply && m == g_msgApply) { apply_focus_state(h); return 0; }
+  LRESULT r = g_oldWndProc ? CallWindowProcA(g_oldWndProc, h, m, w, l) : DefWindowProcA(h, m, w, l);
+  switch (m) {
+    case WM_ACTIVATE: case WM_ACTIVATEAPP: case WM_SIZE: case WM_WINDOWPOSCHANGED:
+      apply_focus_state(h); break;
+    case WM_SETCURSOR:
+      if (GetForegroundWindow() == h) confine(h, TRUE);
+      break;
+  }
+  return r;
+}
+
+static DWORD WINAPI cursor_thread(LPVOID unused) {
+  (void)unused;
+  for (int i = 0; i < 3000; i++) {                       // wait up to ~5 minutes for the game window
+    HWND h = FindWindowA("prototypeWindowClass", NULL);
+    DWORD pid = 0;
+    if (h) GetWindowThreadProcessId(h, &pid);
+    if (h && pid == GetCurrentProcessId()) {
+      g_oldWndProc = (WNDPROC)GetWindowLongPtrA(h, GWLP_WNDPROC);   // set before swapping: no NULL window
+      SetWindowLongPtrA(h, GWLP_WNDPROC, (LONG_PTR)cursor_wndproc);
+      PostMessageA(h, g_msgApply, 0, 0);                             // apply the state on the window's own thread
+      logf_append(g_confine ? "HideCursor: game window found - cursor hidden and confined while the game is active."
+                            : "HideCursor: game window found - cursor hidden while the game is active.");
+      return 0;
+    }
+    Sleep(100);
+  }
+  logf_append("HideCursor: game window not found - window part skipped.");
+  return 0;
+}
+
+static void apply_hide_cursor(void) {
+  if (!ini_int("Window", "HideCursor", 1)) { logf("HideCursor: off (P2PhysFix.ini [Window] HideCursor=0)"); return; }
+  g_confine = ini_int("Window", "ConfineCursor", 1);
+  HMODULE eng = GetModuleHandleA(ENGINE_NAME);
+  IMAGE_NT_HEADERS *nt = eng ? (IMAGE_NT_HEADERS *)((BYTE *)eng + ((IMAGE_DOS_HEADER *)eng)->e_lfanew) : NULL;
+  if (!nt || (DWORD)(ULONG_PTR)eng != ENGINE_BASE || nt->FileHeader.TimeDateStamp != ENGINE_TS) {
+    logf("HideCursor: unsupported or missing %s - skipped.", ENGINE_NAME);
+    return;
+  }
+  DWORD cur = *(DWORD *)(ULONG_PTR)ENG_IAT_SHOWCURSOR;
+  FARPROC real = GetProcAddress(GetModuleHandleA("user32.dll"), "ShowCursor");
+  if (!cur) { logf("HideCursor: engine ShowCursor import is empty - skipped."); return; }
+  if (cur != (DWORD)(ULONG_PTR)real) logf("HideCursor: engine ShowCursor import already redirected (0x%08X) - chaining.", (unsigned)cur);
+  g_realShowCursor = (ShowCursor_t)(ULONG_PTR)cur;
+  DWORD hook = (DWORD)(ULONG_PTR)&showcursor_hook;
+  patch(ENG_IAT_SHOWCURSOR, (const BYTE *)&hook, 4);
+  logf("HideCursor: engine ShowCursor redirected - cursor visibility is now absolute (ConfineCursor=%d).", g_confine);
+  g_msgApply = RegisterWindowMessageA("P2PhysFix.ApplyCursorState");
+  HANDLE t = CreateThread(NULL, 0, cursor_thread, NULL, 0, NULL);
+  if (t) CloseHandle(t); else logf("HideCursor: CreateThread failed (%lu).", GetLastError());
+}
+
+// --- minimize on focus loss -------------------------------------------------
+// On focus loss the engine calls ShowWindow(hwnd, SW_MINIMIZE) (engine 0x10684845: push 6 / push ecx /
+// call [ShowWindow]). In borderless mode that forces a D3D device reset on every alt+tab, and overlays (e.g. AMD's
+// performance overlay) need a couple of seconds to re-attach after the window comes back. Optional: skip the call.
+#define ENG_MINIMIZE_CALL 0x10684845u
+static void apply_minimize(void) {
+  if (ini_int("Window", "MinimizeOnFocusLoss", 1)) return;          // default: vanilla behavior
+  HMODULE eng = GetModuleHandleA(ENGINE_NAME);
+  IMAGE_NT_HEADERS *nt = eng ? (IMAGE_NT_HEADERS *)((BYTE *)eng + ((IMAGE_DOS_HEADER *)eng)->e_lfanew) : NULL;
+  if (!nt || (DWORD)(ULONG_PTR)eng != ENGINE_BASE || nt->FileHeader.TimeDateStamp != ENGINE_TS) {
+    logf("MinimizeOnFocusLoss: unsupported or missing %s - skipped.", ENGINE_NAME);
+    return;
+  }
+  static const BYTE orig[] = {0x6a, 0x06, 0x51, 0xff, 0x15, 0x08, 0x54, 0x9e, 0x10};   // push 6 / push ecx / call [ShowWindow]
+  if (memcmp((void *)(ULONG_PTR)ENG_MINIMIZE_CALL, orig, sizeof(orig)) != 0) {
+    logf("MinimizeOnFocusLoss: unexpected bytes at 0x%08X - skipped.", ENG_MINIMIZE_CALL);
+    return;
+  }
+  static const BYTE skip[] = {0x83, 0xc4, 0x08, 0x90, 0x90, 0x90};                      // add esp,8 (drop the 2 args)
+  patch(ENG_MINIMIZE_CALL + 3, skip, sizeof(skip));
+  logf("MinimizeOnFocusLoss: off - the game window stays on screen when it loses focus.");
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
   (void)reserved;
   if (reason == DLL_PROCESS_ATTACH) {
@@ -254,6 +383,8 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     logf("P2PhysFix " P2PF_VERSION " - Prototype 2 physics race crash fix");
     apply();
     apply_borderless();
+    apply_hide_cursor();
+    apply_minimize();
     {
       char extra[256] = {0};
       if (g_ini[0]) GetPrivateProfileStringA("CommandLine", "Options", "", extra, sizeof(extra), g_ini);
