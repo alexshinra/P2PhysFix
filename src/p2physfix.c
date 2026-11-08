@@ -14,7 +14,7 @@
 #include <stdarg.h>
 #include <string.h>
 
-#define P2PF_VERSION "1.3.0"
+#define P2PF_VERSION "1.3.1"
 
 // prototype2.exe (Steam 2025-09-29 update) window-mode selector: 0 = fullscreen, 1 = borderless, 2 = windowed.
 // It returns 1 only for "windowed borderless" on the command line; we can force it.
@@ -37,6 +37,7 @@
 #define ALT_SIZE      0x00400000u   // 4 MB side stack
 
 static HANDLE g_log = INVALID_HANDLE_VALUE;
+static volatile DWORD g_caveVars[4];   // code cave data: saved top, saved limit, side-stack base (read/write section)
 
 static void logf(const char *fmt, ...) {
   char buf[512];
@@ -119,11 +120,14 @@ static void apply(void) {
     }
   }
 
-  BYTE *mem = (BYTE *)VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+  // W^X: the cave is written into a read/write page, then switched to read/execute before anything runs it.
+  // Its three variables live in this DLL's own data section (g_caveVars), which stays read/write.
+  BYTE *mem = (BYTE *)VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
   if (!mem) { logf("ERROR: VirtualAlloc failed (%lu) - nothing patched.", GetLastError()); return; }
-  DWORD vSavedTop = (DWORD)(ULONG_PTR)(mem + 0), vSavedLimit = vSavedTop + 4, vAltBase = vSavedTop + 8;
+  DWORD vSavedTop = (DWORD)(ULONG_PTR)&g_caveVars[0], vSavedLimit = (DWORD)(ULONG_PTR)&g_caveVars[1],
+        vAltBase = (DWORD)(ULONG_PTR)&g_caveVars[2];
 
-  Emit e = { mem + 0x20, mem };
+  Emit e = { mem, mem };
   // cave_init(size): eax = malloc(size + ALT); altBase = eax + size
   DWORD caveInit = here(&e);
   eb(&e, 0x8b); eb(&e, 0x44); eb(&e, 0x24); eb(&e, 0x04);          // mov eax,[esp+4]
@@ -153,8 +157,14 @@ static void apply(void) {
   eb(&e, 0xa1); ed(&e, vSavedTop);   eb(&e, 0xa3); ed(&e, G_TOP);
   eb(&e, 0xa1); ed(&e, vSavedLimit); eb(&e, 0xa3); ed(&e, G_LIMIT);
   eb(&e, 0x58); eb(&e, 0xc3);
+  DWORD oldProt;
+  if (!VirtualProtect(mem, 4096, PAGE_EXECUTE_READ, &oldProt)) {
+    logf("ERROR: VirtualProtect on the code cave failed (%lu) - nothing patched.", GetLastError());
+    VirtualFree(mem, 0, MEM_RELEASE);
+    return;
+  }
   FlushInstructionCache(GetCurrentProcess(), mem, 4096);
-  logf("code cave at %p (%d bytes)", (void *)mem, (int)(e.p - mem));
+  logf("code cave at %p (%d bytes, read+execute)", (void *)mem, (int)(e.p - mem));
 
   BYTE buf[16];
   // 1) init: push esi x3 / call cave_init / nop   (caller still does add esp,0Ch)
@@ -229,6 +239,11 @@ static void apply_options(BYTE *tramp) {
   }
   memcpy(tramp, orig, sizeof(orig));                                             // trampoline: original 8 bytes + jmp back
   tramp[8] = 0xe9; rel32_at(tramp + 9, (DWORD)(ULONG_PTR)(tramp + 8), ENG_HASOPTION + 8);
+  DWORD oldProt;                                                                 // W^X: written as read/write, run as read/execute
+  if (!VirtualProtect(tramp, 4096, PAGE_EXECUTE_READ, &oldProt)) {
+    logf("Options: VirtualProtect on the trampoline failed (%lu) - options not injected.", GetLastError());
+    return;
+  }
   FlushInstructionCache(GetCurrentProcess(), tramp, 16);
   g_hasopt_orig = (HasOption_t)(void *)tramp;
   BYTE j[8] = {0xe9, 0, 0, 0, 0, 0x90, 0x90, 0x90};
@@ -425,7 +440,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
       BYTE *tramp = NULL;
       if (!nt || (DWORD)(ULONG_PTR)eng != ENGINE_BASE || nt->FileHeader.TimeDateStamp != ENGINE_TS)
         logf("Options: unsupported or missing %s - options not injected.", ENGINE_NAME);
-      else if (!(tramp = (BYTE *)VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)))
+      else if (!(tramp = (BYTE *)VirtualAlloc(NULL, 4096, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)))
         logf("Options: VirtualAlloc failed - options not injected.");
       else
         apply_options(tramp);

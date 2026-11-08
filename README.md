@@ -12,8 +12,8 @@ All changes are applied in memory at startup. No game files are modified. The pl
 
 ## What the code does (for reviewers)
 
-- **`apply()`.** It verifies `prototype2engine.dll` (base `0x10000000`, timestamp `0x68B09A3A`) and the original bytes at 8 addresses. It allocates one 4 KB RWX page (`VirtualAlloc`) for a small code cave of 148 bytes. The cave holds the stack-swap and init code; the plugin emits the bytes itself in `apply()`. It patches the 8 call sites with `VirtualProtect` + `memcpy` + `FlushInstructionCache`.
-- **`apply_borderless()` / `apply_options()`** (opt-in via ini). They change 6 bytes of the exe's window-mode selector at `0x401210` and hook the engine's command-line check `HasOption` at `0x10673170` through a trampoline.
+- **`apply()`.** It verifies `prototype2engine.dll` (base `0x10000000`, timestamp `0x68B09A3A`) and the original bytes at 8 addresses. It allocates one 4 KB page for a 116-byte code cave (`VirtualAlloc` with read/write). It writes the stack-swap and init code, then switches the page to read/execute (`VirtualProtect`, no RWX memory). The cave's three variables live in the DLL's own data section. It patches the 8 call sites with `VirtualProtect` + `memcpy` + `FlushInstructionCache`.
+- **`apply_borderless()` / `apply_options()`** (opt-in via ini). They change 6 bytes of the exe's window-mode selector at `0x401210` and hook the engine's command-line check `HasOption` at `0x10673170` through a trampoline. The trampoline page is also written read/write and then switched to read/execute.
 - **`apply_hide_cursor()`.** It redirects the engine's `ShowCursor` import (IAT `0x109E541C`) to a function that normalizes the cursor counter to -1/0. A helper thread waits for the game window (`prototypeWindowClass`) and subclasses it to re-apply the state on focus changes and to call `ClipCursor` while the game is active.
 - **`apply_minimize()`** (opt-in). It replaces the engine's `ShowWindow(SW_MINIMIZE)` call at `0x10684848` with `add esp,8`.
 - **`apply_workers()`.** It sets the worker-pool size at `0x1065FFAE` (`7f 07 b8 01 00 00 00` → `90 90 b8 02 00 00 00`). This is the same instruction that PrototypeFix's CPUThreadCountFix changes to 4.
@@ -24,13 +24,14 @@ All changes are applied in memory at startup. No game files are modified. The pl
 Requires [Zig 0.17.1](https://ziglang.org/download/) (zig-x86_64-windows-0.17.1.zip). No other dependencies.
 
 ```
-zig cc -target x86-windows-gnu -shared -O2 -s -Wall -Wextra -o P2PhysFix.asi src/p2physfix.c -lkernel32 -luser32
+zig rc src/version.rc version.res
+zig cc -target x86-windows-gnu -shared -O2 -s -Wall -Wextra -o P2PhysFix.asi src/p2physfix.c version.res -lkernel32 -luser32
 ```
 
 You can also run `src/build.ps1`, which writes `build/P2PhysFix.asi`.
 
-The release `P2PhysFix.asi` 1.3.0 has SHA-256
-`9A4E9CFA09E8EA3E3AF17287A4A9F00F17753EEC26BD2666C098A634471223C7`.
+The release `P2PhysFix.asi` 1.3.1 has SHA-256
+`9969180FC3661AADF0A3E05C01CD07C1D3C6857D1DA27192F2563FDF0C3D8FB1`.
 Building with the command above and Zig 0.17.1 gives a byte-identical file.
 
 ## Install
@@ -41,6 +42,7 @@ Building with the command above and Zig 0.17.1 gives a byte-identical file.
 
 ## Changelog
 
+- **1.3.1** — no behavior change: W^X memory for the code cave and trampoline (no RWX allocations), plus VERSIONINFO in the DLL.
 - **1.3.0** — engine worker threads forced to 2: fixes the slow drift / camera jumps / dead Esc caused by 4 workers.
 - **1.2.0** — absolute cursor visibility (no Windows arrow, no AMD overlay flicker), cursor confinement, optional "don't minimize on alt+tab".
 - **1.1.0** — optional borderless window (built-in 2025 exe mode), engine command-line flags.

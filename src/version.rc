@@ -1,0 +1,30 @@
+// Version information for P2PhysFix.asi (shown in Explorer > Properties > Details).
+1 VERSIONINFO
+FILEVERSION     1,3,1,0
+PRODUCTVERSION  1,3,1,0
+FILEFLAGSMASK   0x3F
+FILEFLAGS       0x0
+FILEOS          0x40004
+FILETYPE        0x2
+FILESUBTYPE     0x0
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "040904B0"
+    BEGIN
+      VALUE "CompanyName",      "P2PhysFix contributors"
+      VALUE "FileDescription",  "P2PhysFix - Prototype 2 physics crash fix (ASI plugin)"
+      VALUE "FileVersion",      "1.3.1"
+      VALUE "InternalName",     "P2PhysFix"
+      VALUE "LegalCopyright",   "Copyright (c) 2026 P2PhysFix contributors. MIT License."
+      VALUE "OriginalFilename", "P2PhysFix.asi"
+      VALUE "ProductName",      "P2PhysFix"
+      VALUE "ProductVersion",   "1.3.1"
+      VALUE "Comments",         "Source code: https://github.com/alexshinra/P2PhysFix"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x409, 1200
+  END
+END
