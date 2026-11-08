@@ -14,7 +14,7 @@
 #include <stdarg.h>
 #include <string.h>
 
-#define P2PF_VERSION "1.2.0"
+#define P2PF_VERSION "1.3.0"
 
 // prototype2.exe (Steam 2025-09-29 update) window-mode selector: 0 = fullscreen, 1 = borderless, 2 = windowed.
 // It returns 1 only for "windowed borderless" on the command line; we can force it.
@@ -374,6 +374,34 @@ static void apply_minimize(void) {
   logf("MinimizeOnFocusLoss: off - the game window stays on screen when it loses focus.");
 }
 
+// --- worker thread count ----------------------------------------------------
+// The engine sizes its worker pool as (logical CPUs in the affinity mask) - 2, clamped to 1..7 (engine 0x1065FF86,
+// config -2 set at 0x10684F6F). 12+ threads -> 7 workers -> crash on load. PrototypeFix's CPUThreadCountFix
+// forces 4. The game was built for quad cores = 2 workers; with 4 workers the engine's data slowly gets corrupted
+// (character drifts in flight, camera jumps, Esc stops opening the pause menu after a few minutes).
+// [Engine] WorkerThreads = N (default 2) forces N (1..7); it also overrides CPUThreadCountFix if that ran first.
+#define ENG_WORKERS_SITE 0x1065FFAEu
+static void apply_workers(void) {
+  int n = ini_int("Engine", "WorkerThreads", 2);
+  if (n <= 0) return;
+  if (n > 7) n = 7;
+  HMODULE eng = GetModuleHandleA(ENGINE_NAME);
+  IMAGE_NT_HEADERS *nt = eng ? (IMAGE_NT_HEADERS *)((BYTE *)eng + ((IMAGE_DOS_HEADER *)eng)->e_lfanew) : NULL;
+  if (!nt || (DWORD)(ULONG_PTR)eng != ENGINE_BASE || nt->FileHeader.TimeDateStamp != ENGINE_TS) {
+    logf("WorkerThreads: unsupported or missing %s - skipped.", ENGINE_NAME);
+    return;
+  }
+  BYTE *p = (BYTE *)(ULONG_PTR)ENG_WORKERS_SITE;
+  static const BYTE vanilla[] = {0x7f, 0x07, 0xb8, 0x01, 0x00, 0x00, 0x00};   // jg +7 / mov eax,1
+  BOOL ours = memcmp(p, vanilla, sizeof(vanilla)) == 0;
+  BOOL pfix = p[0] == 0x90 && p[1] == 0x90 && p[2] == 0xb8 && p[4] == 0 && p[5] == 0 && p[6] == 0;   // already forced
+  if (!ours && !pfix) { logf("WorkerThreads: unexpected bytes at 0x%08X - skipped.", ENG_WORKERS_SITE); return; }
+  BYTE newb[7] = {0x90, 0x90, 0xb8, (BYTE)n, 0x00, 0x00, 0x00};               // nop nop / mov eax,N
+  patch(ENG_WORKERS_SITE, newb, 7);
+  logf("WorkerThreads: engine worker pool forced to %d thread(s)%s.", n,
+       pfix ? " (overrides PrototypeFix CPUThreadCountFix)" : "");
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
   (void)reserved;
   if (reason == DLL_PROCESS_ATTACH) {
@@ -385,6 +413,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved) {
     apply_borderless();
     apply_hide_cursor();
     apply_minimize();
+    apply_workers();
     {
       char extra[256] = {0};
       if (g_ini[0]) GetPrivateProfileStringA("CommandLine", "Options", "", extra, sizeof(extra), g_ini);
